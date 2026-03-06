@@ -1,0 +1,9 @@
+[submodule "commons-operator"]
+	path = commons-operator
+	url = git@github.com:soenkeliebau/commons-operator.git
+[submodule "nifi-operator"]
+	path = nifi-operator
+	url = git@github.com:soenkeliebau/nifi-operator.git
+[submodule "operator-rs"]
+	path = operator-rs
+	url = git@github.com:soenkeliebau/operator-rs.git
