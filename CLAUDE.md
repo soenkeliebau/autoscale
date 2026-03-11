@@ -19,7 +19,7 @@ cargo doc --no-deps --all-features 2>&1 | grep -E "^warning" && echo "Doc warnin
 
 ## Error Handling with `snafu`
 
-All error handling **must** use [`snafu`](https://docs.rs/snafu). No `unwrap()`, `expect()`, or `Box<dyn Error>` in library code.
+All error handling **must** use [`snafu`](https://docs.rs/snafu). No `unwrap()`, `expect()`, or `Box<dyn Error>` in any code.
 
 ### Error Enum Structure
 
