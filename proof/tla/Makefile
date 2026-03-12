@@ -1,12 +1,15 @@
 TLA2TOOLS := tla2tools.jar
 JAVA := java
-TLC_OPTS := -workers auto
+TLC_OPTS := -workers auto -deadlock
 TLA2TOOLS_URL := https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 
-.PHONY: check-framework check-nifi check-toctou check-all simulate clean download-tools
+.PHONY: translate check-framework check-nifi check-toctou check-all simulate clean download-tools
 
 download-tools:
 	@test -f $(TLA2TOOLS) || curl -L -o $(TLA2TOOLS) $(TLA2TOOLS_URL)
+
+translate: download-tools StackableScalerFramework.tla
+	$(JAVA) -cp $(TLA2TOOLS) pcal.trans StackableScalerFramework.tla
 
 check-framework: download-tools StackableScalerFramework.tla StackableScalerFramework.cfg
 	$(JAVA) -jar $(TLA2TOOLS) -config StackableScalerFramework.cfg $(TLC_OPTS) StackableScalerFramework.tla
