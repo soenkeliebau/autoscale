@@ -7,3 +7,6 @@
 [submodule "operator-rs"]
 	path = operator-rs
 	url = git@github.com:soenkeliebau/operator-rs.git
+[submodule "trino-operator"]
+	path = trino-operator
+	url = git@github.com:stackabletech/trino-operator.git
