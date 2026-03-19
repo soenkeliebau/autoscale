@@ -1,9 +1,9 @@
 # ADR: StackableScaler — HPA Integration with Operator-Controlled Scaling Hooks
 
 **Date:** 2026-03-06
-**Status:** Implemented
+**Status:** Implemented (revised 2026-03-19 — Decisions 2, 3, 4 superseded by `ReplicasConfig`)
 **Deciders:** Stackable platform team
-**Repositories:** `operator-rs`, `nifi-operator`
+**Repositories:** `operator-rs`, `commons-operator`, `nifi-operator`, `trino-operator`
 
 ---
 
@@ -61,36 +61,26 @@ KEDA supports custom scaler plugins and has a more flexible pause/resume mechani
 
 **Decision:** Follow the `S3Connection` pattern. `StackableScaler` is defined in `operator-rs/crates/stackable-operator/src/crd/scaler/`, registered in `operator-rs/crates/stackable-operator/src/crd/mod.rs`, and installed by the commons operator. NiFi is the proof-of-concept; other operators adopt the pattern by implementing the `ScalingHooks` trait.
 
-### Decision 2: Activation via `replicas: 0` convention
+### Decision 2: ~~Activation via `replicas: 0` convention~~ → Superseded by `ReplicasConfig`
 
-**Options considered:**
-- Require an explicit `scalingMode: external` field in the cluster spec
-- Reuse the existing `replicas: 0` convention, which already signals "externally managed replicas"
-- Validate at `StackableScaler` creation time that `replicas: 0` is set, and reject otherwise
+> **Superseded (2026-03-19):** The `replicas: 0` convention was replaced by a `ReplicasConfig` enum
+> (`Fixed`/`Hpa`/`Auto`/`ExternallyScaled`) on role groups. See `docs/superpowers/specs/2026-03-19-replicas-config-design.md`
+> and PR.md Decision 3 for the rationale. The operator now creates StackableScaler and HPA resources
+> automatically based on the variant — users never interact with StackableScaler directly unless they
+> choose `ExternallyScaled`.
 
-The existing codebase already uses `replicas: 0` to suppress operator-driven StatefulSet replica management (a prior workaround for users wanting to use HPAs directly against the StatefulSet). Adding a new field would require changes to every product CRD.
+### Decision 3: ~~`clusterRef` without `apiVersion`~~ → Superseded: spec slimmed to `replicas` only
 
-**Decision:** Reuse `replicas: 0`. A `StackableScaler` is only effective for a role group where `spec.replicas == 0`. If `replicas: 0` is set but no `StackableScaler` exists, the existing behaviour is preserved (backwards compatibility). A validating webhook on `StackableScaler` creation enforces the constraint and rejects resources targeting role groups where `replicas != 0`. This makes the activation convention explicit and detectable.
+> **Superseded (2026-03-19):** The `clusterRef`, `role`, and `roleGroup` fields were removed from
+> `StackableScalerSpec`. The spec now contains only `replicas: i32`. Identity is conveyed through
+> owner references and standard Stackable labels set by `build_scaler()`. See PR.md Decision 11.
 
-### Decision 3: `clusterRef` without `apiVersion`
+### Decision 4: ~~Label-based watch filtering via mutating webhook~~ → Superseded by `.owns()`
 
-**Options considered:**
-- `clusterRef: { apiVersion, kind, name }` — fully qualified reference
-- `clusterRef: { kind, name }` — kind-only reference
-
-Including `apiVersion` in `clusterRef` creates coupling to specific CRD versions and complicates version upgrades. CRD conversion webhooks already handle API version transitions; the `StackableScaler` need not duplicate that mapping.
-
-**Decision:** `clusterRef` contains only `kind` and `name`. The `kind` field drives label-based watch filtering (see Decision 4). `apiVersion` was removed from the design.
-
-### Decision 4: Label-based watch filtering via mutating webhook
-
-Each product operator should watch only the `StackableScaler` resources that target its cluster kind. Two approaches were considered:
-
-**Option A:** Require users to set `stackable.tech/cluster-kind: NifiCluster` manually on every `StackableScaler`.
-
-**Option B:** A mutating admission webhook in the commons operator reads `spec.clusterRef.kind` on `StackableScaler` CREATE and UPDATE and sets the label automatically.
-
-**Decision:** Option B. User-facing label requirements are error-prone and undiscoverable. The commons operator already runs admission webhooks; adding one for `StackableScaler` is a natural fit. Product operators use `watcher::Config::default().labels("stackable.tech/cluster-kind=NifiCluster")` for server-side filtering, but do not require users to maintain the label manually.
+> **Superseded (2026-03-19):** Label-based discovery was replaced by owner references and `.owns()`.
+> The operator sets owner references on StackableScaler and HPA via `build_scaler()` and
+> `build_hpa_from_user_spec()`, then uses `.owns::<StackableScaler>()` for event routing.
+> No label-injection webhook is needed. See PR.md Decision 4.
 
 ### Decision 5: Trait-based hook interface
 
@@ -169,9 +159,11 @@ The standard Kubernetes HPA has no mechanism to be told to permanently stop. Whe
 
 `JobTracker` derives job names deterministically from the scaler name and stage (e.g., `my-scaler-pre-scale`). If the cleanup delete after a successful job fails (best-effort), and the same scaler is asked to scale again, the second `start_or_check` call finds the completed job from the first event, sees `succeeded > 0`, and returns `Done` without running a new offload. Incorporating a generation counter or `desiredReplicas` into the job name would address this; it is left as a follow-up.
 
-### Webhook implementation out of scope
+### ~~Webhook implementation out of scope~~ → Resolved
 
-The mutating and validating webhooks described in this ADR (label injection, `spec.replicas` seeding from current StatefulSet on creation, mid-flight write rejection, `replicas: 0` enforcement) must be implemented in the commons operator. This work was not part of the initial implementation and is documented in `docs/plans/2026-03-06-stackable-scaler-impl.md` Task 11.
+> **Resolved (2026-03-19):** The admission webhook is implemented in the commons-operator. It
+> validates mid-flight `spec.replicas` changes (rejecting writes during active scaling). The
+> label-injection webhook was not needed after the switch to `.owns()`. See PR.md Decision 8.
 
 ---
 
@@ -179,21 +171,37 @@ The mutating and validating webhooks described in this ADR (label injection, `sp
 
 ```
 operator-rs/crates/stackable-operator/src/crd/scaler/
-├── mod.rs          — StackableScaler CRD types, resolve_replicas helper
-├── hooks.rs        — ScalingHooks trait, ScalingContext, HookOutcome, ScalingCondition
-├── reconciler.rs   — reconcile_scaler state machine driver
-└── job_tracker.rs  — JobTracker helper for Job-based async hooks
+├── mod.rs                  — StackableScaler CRD types, resolve_replicas helper
+├── replicas_config.rs      — ReplicasConfig enum, HpaConfig, AutoConfig, validation
+├── builder.rs              — build_scaler() with labels and owner reference
+├── hpa_builder.rs          — build_hpa_from_user_spec(), scale_target_ref(), initialize_scaler_status()
+├── hooks.rs                — ScalingHooks trait, ScalingContext, HookOutcome, ScalingCondition
+├── reconciler.rs           — reconcile_scaler state machine driver
+├── cluster_resource_impl.rs — DeepMerge impl for StackableScaler
+└── job_tracker.rs          — JobTracker helper for Job-based async hooks
+
+commons-operator/rust/operator-binary/src/
+├── webhooks/scaler_admission.rs — Validation webhook for mid-flight spec.replicas changes
+└── main.rs                      — StackableScaler CRD rollout, webhook registration
 
 nifi-operator/rust/operator-binary/src/
 ├── operations/scaling.rs   — NifiScalingHooks implementation
-├── main.rs                 — StackableScaler watch registration
-└── controller.rs           — scaler lookup, reconcile_scaler call, resolve_replicas
+├── main.rs                 — .owns() registration for StackableScaler and HPA
+└── controller.rs           — ReplicasConfig-based reconcile, replicas preservation, reconcile_scaler call
+
+trino-operator/rust/operator-binary/src/
+├── operations/scaling.rs   — TrinoScalingHooks implementation (worker graceful shutdown)
+├── main.rs                 — .owns() registration for StackableScaler and HPA
+└── controller.rs           — ReplicasConfig-based reconcile, worker-only guard
 ```
 
 ---
 
 ## References
 
-- Design document: `docs/plans/2026-03-06-stackable-scaler-design.md`
-- Implementation plan: `docs/plans/2026-03-06-stackable-scaler-impl.md`
+- Original design document: `docs/plans/2026-03-06-stackable-scaler-design.md` (partially superseded)
+- Original implementation plan: `docs/plans/2026-03-06-stackable-scaler-impl.md` (partially superseded)
+- **Current design spec:** `docs/superpowers/specs/2026-03-19-replicas-config-design.md`
+- **Current implementation plan:** `docs/superpowers/plans/2026-03-19-replicas-config-rewrite.md`
+- Pull request description: `PR.md`
 - `S3Connection` pattern reference: `operator-rs/crates/stackable-operator/src/crd/s3/`

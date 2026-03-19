@@ -2,6 +2,12 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
+> **Partially superseded (2026-03-19):** This plan was the original implementation guide for
+> StackableScaler. It was executed and then superseded by the `ReplicasConfig` rewrite plan at
+> `docs/superpowers/plans/2026-03-19-replicas-config-rewrite.md`. The `replicas: 0` activation,
+> `clusterRef` fields, and label-based discovery described here are no longer current. The state
+> machine, hook framework, and reconciler logic remain largely intact.
+
 **Goal:** Implement the `StackableScaler` CRD, state machine, and hook framework in `operator-rs`, then wire it into `nifi-operator` as the proof-of-concept.
 
 **Architecture:** `StackableScaler` is a new CRD in `operator-rs` exposing a Kubernetes `/scale` subresource. HPAs target it instead of StatefulSets directly. `operator-rs` drives a state machine (`Idle → PreScaling → Scaling → PostScaling → Idle`) and calls a `ScalingHooks` trait implemented per-product. NiFi uses this to offload nodes before scale-down via a Kubernetes Job. The feature activates only when `roleGroup.replicas == 0`.

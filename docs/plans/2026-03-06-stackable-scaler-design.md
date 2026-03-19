@@ -1,8 +1,14 @@
 # StackableScaler Design
 
 **Date:** 2026-03-06
-**Status:** Approved
+**Status:** Partially superseded (2026-03-19)
 **Scope:** `operator-rs` (shared infrastructure) + `nifi-operator` (proof of concept)
+
+> **Note (2026-03-19):** This document describes the original StackableScaler design. Key parts
+> have been superseded by the `ReplicasConfig` rewrite: the `replicas: 0` activation convention
+> (replaced by `ReplicasConfig` enum), `clusterRef` fields (replaced by owner references), and
+> label-based discovery (replaced by `.owns()`). See `docs/superpowers/specs/2026-03-19-replicas-config-design.md`
+> for the current design and `docs/adr/2026-03-06-stackable-scaler.md` for the updated ADR.
 
 ---
 

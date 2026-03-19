@@ -1,5 +1,10 @@
 # StackableScaler Admission Webhook
 
+> **Partially superseded (2026-03-19):** The label-injection webhook (ADR Decision 4) was dropped
+> entirely — replaced by owner references and `.owns()`. The validation webhook (ADR Decision 8)
+> was implemented in the commons-operator as described here (mid-flight `spec.replicas` rejection).
+> See `docs/adr/2026-03-06-stackable-scaler.md` Decisions 4 and 8 for the updated status.
+
 ## Context
 
 The StackableScaler ADR specifies webhook operations (Decisions 4, 8) that are currently unimplemented. Without them:

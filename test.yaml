@@ -1,4 +1,5 @@
 ---
+# Shared resources for all NifiCluster examples
 apiVersion: v1
 kind: Secret
 metadata:
@@ -15,11 +16,18 @@ spec:
     static:
       userCredentialsSecret:
         name: simple-admin-credentials
+
+# =============================================================================
+# Scenario 1: Fixed replicas (bare integer shorthand)
+#
+# The operator manages a fixed number of replicas directly.
+# This is the default and most common configuration.
+# =============================================================================
 ---
 apiVersion: nifi.stackable.tech/v1alpha1
 kind: NifiCluster
 metadata:
-  name: simple-nifi
+  name: nifi-fixed
 spec:
   image:
     productVersion: 2.6.0
@@ -34,27 +42,120 @@ spec:
       listenerClass: external-unstable
     roleGroups:
       default:
-        replicas: 0
-    # When NiFi is exposed through a NodePort Service it's SNI check has to be disabled
+        replicas:
+          fixed: 2
     configOverrides:
       nifi.properties:
         nifi.web.https.sni.required: "false"
         nifi.web.https.sni.host.check: "false"
+
+# =============================================================================
+# Scenario 2: HPA-managed replicas
+#
+# The operator creates a HorizontalPodAutoscaler targeting the StatefulSet.
+# The HPA spec is passed through directly; the operator fills in
+# scaleTargetRef automatically.
+# =============================================================================
 ---
-apiVersion: autoscaling.stackable.tech/v1alpha1
-kind: StackableScaler
+apiVersion: nifi.stackable.tech/v1alpha1
+kind: NifiCluster
 metadata:
-  name: simple-nifi-nodes-default
-  labels:
-    stackable.tech/cluster-kind: NifiCluster
-    app.kubernetes.io/name: nifi
-    app.kubernetes.io/instance: simple-nifi
-    app.kubernetes.io/component: node
-    app.kubernetes.io/role-group: default
+  name: nifi-hpa
 spec:
-  replicas: 2
-  clusterRef:
-    kind: NifiCluster
-    name: simple-nifi
-  role: node
-  roleGroup: default
+  image:
+    productVersion: 2.6.0
+  clusterConfig:
+    authentication:
+      - authenticationClass: simple-nifi-users
+    sensitiveProperties:
+      keySecret: nifi-sensitive-property-key
+      autoGenerate: true
+  nodes:
+    roleConfig:
+      listenerClass: external-unstable
+    roleGroups:
+      default:
+        replicas:
+          hpa:
+            maxReplicas: 5
+            minReplicas: 1
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 80
+    configOverrides:
+      nifi.properties:
+        nifi.web.https.sni.required: "false"
+        nifi.web.https.sni.host.check: "false"
+
+# =============================================================================
+# Scenario 3: Stackable auto-scaling
+#
+# The operator creates a StackableScaler resource with min/max bounds.
+# A Stackable auto-scaler controller (not part of this operator) watches
+# the StackableScaler and adjusts replicas within the configured range.
+# =============================================================================
+---
+apiVersion: nifi.stackable.tech/v1alpha1
+kind: NifiCluster
+metadata:
+  name: nifi-auto
+spec:
+  image:
+    productVersion: 2.6.0
+  clusterConfig:
+    authentication:
+      - authenticationClass: simple-nifi-users
+    sensitiveProperties:
+      keySecret: nifi-sensitive-property-key
+      autoGenerate: true
+  nodes:
+    roleConfig:
+      listenerClass: external-unstable
+    roleGroups:
+      default:
+        replicas:
+          auto:
+            minReplicas: 1
+            maxReplicas: 10
+    configOverrides:
+      nifi.properties:
+        nifi.web.https.sni.required: "false"
+        nifi.web.https.sni.host.check: "false"
+
+# =============================================================================
+# Scenario 4: Externally scaled
+#
+# The operator creates a StackableScaler with a /scale subresource but does
+# not set a replica count itself. An external controller (e.g. KEDA, a custom
+# HPA, or a manual process) targets the StackableScaler /scale endpoint to
+# drive the replica count.
+# =============================================================================
+---
+apiVersion: nifi.stackable.tech/v1alpha1
+kind: NifiCluster
+metadata:
+  name: nifi-external
+spec:
+  image:
+    productVersion: 2.6.0
+  clusterConfig:
+    authentication:
+      - authenticationClass: simple-nifi-users
+    sensitiveProperties:
+      keySecret: nifi-sensitive-property-key
+      autoGenerate: true
+  nodes:
+    roleConfig:
+      listenerClass: external-unstable
+    roleGroups:
+      default:
+        replicas:
+          externallyScaled: {}
+    configOverrides:
+      nifi.properties:
+        nifi.web.https.sni.required: "false"
+        nifi.web.https.sni.host.check: "false"

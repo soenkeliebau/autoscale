@@ -1,0 +1,48 @@
+# Scenario: Externally scaled
+#
+# The operator creates a StackableScaler with a /scale subresource but does
+# not set a replica count itself. An external controller (e.g. KEDA, a custom
+# HPA, or a manual process) targets the StackableScaler /scale endpoint to
+# drive the replica count.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: simple-admin-credentials
+stringData:
+  admin: admin
+---
+apiVersion: authentication.stackable.tech/v1alpha1
+kind: AuthenticationClass
+metadata:
+  name: simple-nifi-users
+spec:
+  provider:
+    static:
+      userCredentialsSecret:
+        name: simple-admin-credentials
+---
+apiVersion: nifi.stackable.tech/v1alpha1
+kind: NifiCluster
+metadata:
+  name: nifi-external
+spec:
+  image:
+    productVersion: 2.6.0
+  clusterConfig:
+    authentication:
+      - authenticationClass: simple-nifi-users
+    sensitiveProperties:
+      keySecret: nifi-sensitive-property-key
+      autoGenerate: true
+  nodes:
+    roleConfig:
+      listenerClass: external-unstable
+    roleGroups:
+      default:
+        replicas:
+          externallyScaled: {}
+    configOverrides:
+      nifi.properties:
+        nifi.web.https.sni.required: "false"
+        nifi.web.https.sni.host.check: "false"
