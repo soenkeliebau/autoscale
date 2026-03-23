@@ -29,31 +29,91 @@ Requires Node >= 18. Versions above 0.48 need Node >= 20.
  HorizontalPodAutoscaler ───────────────────────> StackableScaler
    (metrics: CPU, mem)   <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  (autoscaling.stackable.tech)
                           reads status.replicas        │
-                                                       │ label selector
-                                              ┌────────┘  matches cluster
+                                                       │ owner reference
+                                              ┌────────┘  links to cluster
                                               ▼
  Admission Webhook ──validates──> StackableScaler
  (commons-operator)                    │
-                                       │ watched by
+                                       │ .owns()
                                        ▼
                               Product Operator ──────owns──────> StatefulSet
                                (nifi / trino)                   replicas: <from scaler>
                                        ▲
                                        │ reconcile
                               Product Cluster CRD
-                              (roleGroup.replicas: 0)
+                              (roleGroup.replicas: { hpa: ... })
 ```
 
-**Key convention:** `roleGroup.replicas: null` signals "externally managed". The operator discovers the matching `StackableScaler` and reads the effective replica count from its status. The HPA writes `spec.replicas` via the `/scale` subresource.
+**Key design:** Scaling is configured via the `ReplicasConfig` enum in the role group `replicas` field. The operator creates and manages StackableScaler and HPA as implementation details. Users only interact with the StackableScaler directly when using `ExternallyScaled`.
 
-Documentation ref: https://docs.stackable.tech/home/stable/concepts/operations/
 ---
 
 # CRD Relations (draw.io)
 
 <img src="/images/crd-relations.drawio.png" class="mx-auto h-96" />
 
-**Key convention:** `roleGroup.replicas: null` signals "externally managed". The HPA writes `spec.replicas` via the `/scale` subresource.
+**Key design:** Scaling configuration lives entirely in the role group `replicas` field. The HPA writes `spec.replicas` on the StackableScaler via the `/scale` subresource.
+
+---
+
+# ReplicasConfig Enum
+
+<div class="grid grid-cols-2 gap-4">
+
+<div>
+
+### User-Facing Config
+
+```yaml
+roleGroups:
+  # Static — direct replica count
+  static-group:
+    replicas: 3             # Fixed(3)
+
+  # HPA — user-provided HPA spec
+  scaled-group:
+    replicas:
+      hpa:
+        spec:
+          maxReplicas: 10
+          metrics: [...]
+
+  # External — user manages HPA/KEDA
+  external-group:
+    replicas: "externallyScaled"
+
+  # Omitted — defaults to Fixed(1)
+  default-group: {}
+```
+
+</div>
+<div>
+
+### Rust Enum
+
+```rust
+pub enum ReplicasConfig {
+    Fixed(u16),
+    Hpa(HpaConfig),
+    Auto(AutoConfig),
+    ExternallyScaled,
+}
+
+impl Default for ReplicasConfig {
+    fn default() -> Self {
+        Self::Fixed(1)
+    }
+}
+```
+
+- Bare integers &rarr; `Fixed(n)`
+- `"externallyScaled"` &rarr; `ExternallyScaled`
+- Tagged objects &rarr; `Hpa`/`Auto`
+- `Fixed(0)` rejected by validation
+- `Auto` not yet implemented
+
+</div>
+</div>
 
 ---
 
@@ -69,14 +129,18 @@ Documentation ref: https://docs.stackable.tech/home/stable/concepts/operations/
 apiVersion: autoscaling.stackable.tech/v1alpha1
 kind: StackableScaler
 metadata:
-  name: nifi-nodes-scaler
+  name: nifi-nodes-default-scaler
+  labels:
+    app.kubernetes.io/name: nifi
+    app.kubernetes.io/instance: my-nifi
+    app.kubernetes.io/component: nodes
+    app.kubernetes.io/role-group: default
+    app.kubernetes.io/managed-by: nifi-operator
+  ownerReferences:
+    - kind: NifiCluster
+      name: my-nifi
 spec:
   replicas: 5          # written by HPA
-  clusterRef:
-    kind: NifiCluster
-    name: my-nifi
-  role: nodes
-  roleGroup: default
 status:
   replicas: 3          # current count
   desiredReplicas: 5
@@ -105,12 +169,18 @@ status:
 
 <br>
 
+### Identity
+
+- **Owner reference** &rarr; parent cluster CR
+- **Labels** &rarr; standard Stackable labels
+- Set by `build_scaler()`, validated by `ClusterResources.add()`
+
 ### Recovery
 
 ```bash
 # Reset from Failed to Idle
 kubectl annotate stackablescaler \
-  nifi-nodes-scaler \
+  nifi-nodes-default-scaler \
   autoscaling.stackable.tech/retry=true
 ```
 
@@ -163,7 +233,7 @@ InProgress hook results trigger a requeue (10s for hooks, 5s for STS convergence
 
 <img src="/images/flowchart.png" class="mx-auto h-80" />
 
-The two highlighted steps are provided by `operator-rs`: **resolve_replicas** reads `scaler.status.replicas` and **reconcile_scaler** drives the state machine and calls product-specific hooks.
+The operator matches on `ReplicasConfig` to decide what resources to create. For `Hpa` and `ExternallyScaled` variants, **`build_scaler()`** creates the StackableScaler and **`reconcile_scaler()`** drives the state machine with product-specific hooks.
 
 ---
 
@@ -225,7 +295,7 @@ Running queries complete before pod deletion.
 
 ---
 
-# Code: CRD & Replica Resolution
+# Code: CRD & ReplicasConfig
 
 <div class="grid grid-cols-2 gap-4">
 
@@ -247,29 +317,20 @@ Running queries complete before pod deletion.
 )]
 pub struct StackableScalerSpec {
     pub replicas: i32,
-    pub cluster_ref: UnknownClusterRef,
-    pub role: String,
-    pub role_group: String,
 }
 ```
 
 </div>
 <div>
 
-### Replica Resolution
+### ReplicasConfig
 
 ```rust
-pub fn resolve_replicas(
-    role_group_replicas: Option<i32>,
-    scaler: Option<&StackableScaler>,
-) -> Option<i32> {
-    match (role_group_replicas, scaler) {
-        // replicas: 0 + scaler = use scaler
-        (Some(0), Some(s)) =>
-            s.status.as_ref().map(|st| st.replicas),
-        // anything else = pass through
-        (replicas, _) => replicas,
-    }
+pub enum ReplicasConfig {
+    Fixed(u16),
+    Hpa(HpaConfig),
+    Auto(AutoConfig),
+    ExternallyScaled,
 }
 ```
 
@@ -293,7 +354,7 @@ pub enum ScalerStage {
 
 # Code: ScalingHooks Trait
 
-```rust 
+```rust
 pub trait ScalingHooks {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -319,32 +380,31 @@ pub trait ScalingHooks {
 
 # Code: Operator Integration
 
-```rust 
-// 1. Discover scaler for role groups with replicas: 0
-let scaler: Option<StackableScaler> = if rg_replicas == Some(0) {
-    client
-        .list_with_label_selector::<StackableScaler>(namespace, &selector)
-        .await?
-        .into_iter()
-        .find(|s| s.spec.cluster_ref.name == cluster.name_any()
-                && s.spec.role == rolegroup.role
-                && s.spec.role_group == rolegroup.role_group)
-} else { None };
+```rust
+let replicas_config = role_group.and_then(|rg| rg.replicas.clone()).unwrap_or_default();
 
-// 2. Resolve effective replica count
-let replicas = resolve_replicas(rg_replicas.map(i32::from), scaler.as_ref());
+let (replicas, scaler_to_reconcile) = match &replicas_config {
+    ReplicasConfig::Fixed(n) => (Some(i32::from(*n)), None),
+    ReplicasConfig::Hpa(hpa_config) => {
+        let scaler = build_scaler(&cluster.name_any(), APP_NAME, namespace,
+            &rolegroup.role, &rolegroup.role_group, 1, &owner_ref, OPERATOR_NAME)?;
+        let applied = cluster_resources.add(client, scaler).await?;
+        if applied.status.is_none() {
+            initialize_scaler_status(client, &applied, 1, &selector_string).await?;
+        }
+        let target_ref = scale_target_ref(&scaler_name, "autoscaling.stackable.tech", "v1alpha1");
+        let hpa = build_hpa_from_user_spec(&hpa_config.spec, &target_ref, ...)?;
+        cluster_resources.add(client, hpa).await?;
+        (applied.status.as_ref().map(|st| st.replicas), Some(applied))
+    }
+    ReplicasConfig::ExternallyScaled => { /* same as Hpa but no HPA created */ }
+    ReplicasConfig::Auto(_) => return Err(Error::AutoScalingNotYetImplemented { .. }),
+};
 
-// 3. Build & apply StatefulSet with resolved replicas
-let rg_statefulset = build_statefulset(replicas, ...)?;
-let applied_sts = cluster_resources.add(client, rg_statefulset).await?;
-
-// 4. Drive scaler state machine
-if let Some(ref s) = scaler {
-    let result = reconcile_scaler(
-        s,
-        &ProductScalingHooks { ... },  // NifiScalingHooks or TrinoScalingHooks
-        client, statefulset_stable, &selector_string,
-    ).await?;
+let applied_sts = cluster_resources.add(client, build_statefulset(replicas, ...)?).await?;
+if let Some(ref s) = scaler_to_reconcile {
+    reconcile_scaler(s, &ProductScalingHooks { ... }, client,
+        statefulset_stable, &selector_string, &rolegroup.role_group).await?;
 }
 ```
 
@@ -358,7 +418,7 @@ Same pattern in both nifi-operator and trino-operator &mdash; only the hooks str
 
 # Code: Trino Hook
 
-```rust 
+```rust
 impl ScalingHooks for TrinoScalingHooks {
     type Error = Error;
 
@@ -396,7 +456,7 @@ impl ScalingHooks for TrinoScalingHooks {
 
 # Code: NiFi Hook (simplified)
 
-```rust 
+```rust
 impl ScalingHooks for NifiScalingHooks {
     type Error = Error;
 
@@ -426,25 +486,29 @@ impl ScalingHooks for NifiScalingHooks {
 
 # Code: Admission Webhook
 
-```rust 
+```rust
+// Uses MutatingWebhook framework (no ValidatingWebhook in stackable-webhook yet),
+// but never returns patches — functionally a validating webhook.
+
 async fn scaler_admission_handler(
     client: Arc<Client>,
     request: AdmissionRequest<StackableScaler>,
 ) -> AdmissionResponse {
     // Validate: reject spec.replicas changes during active scaling
     if request.operation == Operation::Update {
-        if new.spec.replicas != old.spec.replicas {
-            let live = api.get(scaler_name).await?;
-            if live.status.current_state.stage.is_scaling_in_progress() {
-                return deny(
-                    "Cannot update spec.replicas while scaling is in progress"
-                );
+        if let Some(old) = &request.old_object {
+            if scaler.spec.replicas != old.spec.replicas {
+                let live = api.get(scaler_name).await?;
+                if let Some(stage) = stage.filter(|s| s.is_scaling_in_progress()) {
+                    return deny(
+                        "Cannot update spec.replicas while scaling is in progress"
+                    );
+                }
             }
         }
     }
-    // Mutate: inject cluster-kind label from spec.clusterRef.kind
-    patch.add("/metadata/labels/stackable.tech~1cluster-kind", cluster_kind);
-    response.with_patch(patch)
+    // Allow — no patches, no mutations
+    AdmissionResponse::from(&request)
 }
 ```
 

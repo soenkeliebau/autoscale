@@ -248,9 +248,13 @@ async fn validate_scaler(
 }
 ```
 
+### Implementation note
+
+The `stackable-webhook` crate does not yet provide a `ValidatingWebhook` type. The handler uses the existing `MutatingWebhook` framework but never returns patches, making it functionally identical to a validating webhook.
+
 ### What changes
 
-- **Demoted from `MutatingWebhookConfiguration` to `ValidatingWebhookConfiguration`** — no more JSON patches.
+- **Demoted to validation-only** — no more JSON patches. Still registered as a `MutatingWebhookConfiguration` due to framework limitations (see above), but the handler only returns allow/deny.
 - **Label injection removed** — the only mutation is gone.
 - **UPDATE only** — the webhook is registered for `UPDATE` operations only. `CREATE` validation is not needed: the operator creates scalers itself (so spec is always well-formed), and for `ExternallyScaled` the scaler is also operator-created.
 - **Live-object fetch remains** — Kubernetes strips `.status` from `oldObject` in admission requests for CRDs with a status subresource, so the webhook still GETs the current stage.
@@ -280,3 +284,42 @@ Spec fields removed (`clusterRef`, `role`, `roleGroup`), same `v1alpha1` version
 1. **operator-rs** — new `ReplicasConfig` type, updated scaler CRD spec, shared `build_scaler()` helper.
 2. **commons-operator** — swap webhook from mutating to validating, deploy updated CRD.
 3. **Product operators** (nifi, trino) — new reconcile flow with `ClusterResources`-managed scalers, `.owns()` watches.
+
+---
+
+## Section 7: Rejected Alternatives
+
+### `replicas: 0` convention for externally managed scaling
+
+The previous interface used `replicas: 0` on a role group to signal "this role group is scaled by an external mechanism." The operator would then look up a StackableScaler by label selector and read replica counts from its status.
+
+This approach was rejected in favor of the `ReplicasConfig` enum for several reasons:
+
+1. **Poor user experience.** Setting `replicas: 0` to mean "externally managed" is counterintuitive. Users reading a cluster spec see `replicas: 0` and reasonably assume the role group has zero pods. The intent is hidden behind a convention that must be learned.
+
+2. **StackableScaler as implementation detail.** Under the `replicas: 0` model, users had to understand and manually create StackableScaler resources to enable scaling. This leaked an internal implementation detail into the user-facing workflow. With `ReplicasConfig`, the StackableScaler is created and managed entirely by the operator — users never interact with it directly unless they choose the `ExternallyScaled` variant, where exposing the scaler is the explicit intent (the user's external scaler needs a target).
+
+3. **Single place of configuration.** With `ReplicasConfig`, all scaling configuration lives in one place: the role group's `replicas` field in the product cluster CRD. Users specify `replicas: 3` for static, `replicas: { hpa: { spec: ... } }` for HPA-driven, or `replicas: "externallyScaled"` for external control. There is no second resource to create, no label conventions to follow, and no implicit coupling between the cluster CR and a separately managed StackableScaler.
+
+4. **Validation clarity.** `Fixed(0)` is now explicitly rejected by validation. The old model could not distinguish between "I want zero replicas" and "I want external scaling" — both were `replicas: 0`. This ambiguity caused confusion in error messages and made misconfiguration harder to detect.
+
+### Separate CRD for scaling configuration
+
+An alternative was to define scaling configuration in a separate CRD (e.g., a `ScalingPolicy`) rather than inlining it in the role group. This was rejected because it fragments the configuration surface: users would need to maintain two resources in sync, and the operator would need to watch and reconcile both. The inline `ReplicasConfig` field keeps the cluster CRD self-contained.
+
+---
+
+## Appendix: Review Notes
+
+### Code review (2026-03-19)
+
+A post-implementation review identified and resolved the following issues:
+
+- **nifi controller: `unwrap()` on `controller_owner_ref`** — replaced with proper `snafu` error propagation via `.context()`.
+- **nifi controller: wrong error contexts for scaler/HPA operations** — `cluster_resources.add()` calls for StackableScaler and HPA objects were using `ApplyRoleGroupStatefulSetSnafu`, producing misleading error messages. Added dedicated `ApplyScaler`, `ApplyHpa`, and `BuildHpa` error variants.
+- **Missing `.owns()` for HPA** — both nifi and trino controllers registered `.owns()` for StackableScaler but not for `HorizontalPodAutoscaler`, meaning HPA changes would not trigger reconciliation. Added `.owns()` for HPA in both operators.
+- **trino controller: legacy `resolve_replicas()` usage** — replaced with direct status read (`applied_scaler.status.as_ref().map(|st| st.replicas)`) consistent with nifi controller.
+- **trino controller: duplicate `selector_string` construction** — moved to a single construction before the `ReplicasConfig` match, matching the nifi controller pattern.
+- **commons-operator webhook: unreachable dead code** — simplified `is_safe` / `unwrap_or_else("unknown")` pattern to `stage.filter(|s| s.is_scaling_in_progress())`.
+- **Missing debug logging** — added `tracing::debug!` for `ReplicasConfig` variant selection in both operators.
+- **Removed comment restored** — re-added the StatefulSet ordering comment (apply after ConfigMaps/Secrets) that was accidentally deleted in the nifi controller.

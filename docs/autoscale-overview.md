@@ -12,50 +12,82 @@
 │  metrics:           │  ◄──────────────────────  │                         │
 │   - CPU / memory    │  reads status.replicas   │  spec:                  │
 │   - custom metrics  │                          │    replicas: <n>        │
-└─────────────────────┘                          │    clusterRef:          │
-                                                 │      kind: NifiCluster  │
-                                                 │      name: my-nifi      │
-                                                 │    role: nodes          │
-                                                 │    roleGroup: default   │
-                                                 │  status:                │
-                                                 │    replicas: <current>  │
-                                                 │    desiredReplicas: <n> │
-                                                 │    currentState:        │
-                                                 │      stage: Idle        │
-                                                 │    selector: "app=..."  │
-                                                 └───────────┬─────────────┘
-                                                             │
-                                        operator watches &   │  label selector
-                                        reconciles scaler    │  matches cluster
-                                                             ▼
-┌─────────────────────┐  reconcile   ┌──────────────────────────────────────┐
+└─────────────────────┘                          │  status:                │
+   ▲                                             │    replicas: <current>  │
+   │ created by operator                         │    desiredReplicas: <n> │
+   │ for Hpa variant                             │    currentState:        │
+   │                                             │      stage: Idle        │
+   │                                             │    selector: "app=..."  │
+   │                                             └───────────┬─────────────┘
+   │                                                         │
+   │                                      owner reference    │  operator creates
+   │                                      links scaler to    │  and manages via
+   │                                      cluster CR         │  ClusterResources
+   │                                                         ▼
+┌──┴──────────────────┐  reconcile   ┌──────────────────────────────────────┐
 │ Product Operator    │ ◄──────────  │ Product Cluster CRD                  │
 │ (nifi / trino)      │              │ (NifiCluster / TrinoCluster)         │
 │                     │              │                                      │
-│  - discovers scaler │              │  roleGroups:                         │
-│    when replicas: 0 │              │    default:                          │
-│  - calls            │              │      replicas: 0  ◄── opt-in signal  │
-│    reconcile_scaler │              └──────────────────────────────────────┘
-│  - applies STS with │
-│    resolved replica  │
-│    count             │
-└─────────┬───────────┘
-          │ owns
+│  - matches on       │              │  roleGroups:                         │
+│    ReplicasConfig   │              │    default:                          │
+│  - creates scaler   │              │      replicas: 3          # Fixed    │
+│    & HPA via        │              │    scaled:                           │
+│    ClusterResources │              │      replicas:             # Hpa     │
+│  - calls            │              │        hpa:                          │
+│    reconcile_scaler │              │          spec:                       │
+│  - applies STS with │              │            maxReplicas: 10           │
+│    effective replica │              │    external:                         │
+│    count             │              │      replicas:                       │
+└─────────┬───────────┘              │        "externallyScaled" # External │
+          │ owns                     └──────────────────────────────────────┘
           ▼
 ┌─────────────────────┐
 │ StatefulSet          │
 │  replicas: <from     │
-│   scaler status>     │
+│   scaler status or   │
+│   Fixed(n) directly> │
 └─────────────────────┘
 ```
 
-**Key convention:** `roleGroup.replicas: 0` signals "externally managed". The operator
-looks up a `StackableScaler` via label selectors and reads the effective replica count
-from its status.
+**Key design:** Scaling configuration lives entirely in the `replicas` field of the role group
+spec via the `ReplicasConfig` enum. The operator creates and manages StackableScaler and HPA
+resources as implementation details — users only interact with them directly when using the
+`ExternallyScaled` variant.
 
 ---
 
-## 2. Control Flow
+## 2. ReplicasConfig Enum
+
+```yaml
+# Static — operator sets StatefulSet replicas directly
+replicas: 3                          # → ReplicasConfig::Fixed(3)
+
+# HPA — operator creates StackableScaler + HPA from user-provided spec
+replicas:
+  hpa:
+    spec:
+      maxReplicas: 10
+      metrics: [...]                 # → ReplicasConfig::Hpa(HpaConfig)
+
+# Auto — operator generates a product-specific HPA (not yet implemented)
+replicas:
+  auto:
+    minReplicas: 2
+    maxReplicas: 10                  # → ReplicasConfig::Auto(AutoConfig)
+
+# Externally scaled — operator creates StackableScaler only, user manages HPA/KEDA
+replicas: "externallyScaled"         # → ReplicasConfig::ExternallyScaled
+
+# Omitted / null — defaults to Fixed(1)
+```
+
+- `Fixed(0)` is rejected by validation.
+- `Auto` with `minReplicas: 0` or `maxReplicas < minReplicas` is rejected.
+- Bare integers deserialize as `Fixed(n)` via a custom `Deserialize` impl.
+
+---
+
+## 3. Control Flow
 
 ### State Machine
 
@@ -74,14 +106,30 @@ from its status.
 ### Reconcile Loop (per role group)
 
 ```
-1. Discover StackableScaler
-   └─ list by label selector, match clusterRef + role + roleGroup
+1. Read ReplicasConfig from role group spec (default: Fixed(1))
 
-2. Resolve replicas
-   └─ replicas: 0 + scaler found  →  use scaler.status.replicas
-   └─ replicas: N (N > 0)         →  use N directly (no scaler)
+2. Match on variant:
+   ├─ Fixed(n)
+   │   └─ StatefulSet replicas = n, no scaler, no HPA
+   │
+   ├─ Hpa(hpa_config)
+   │   ├─ build_scaler() → cluster_resources.add()
+   │   ├─ initialize_scaler_status() if freshly created
+   │   ├─ build_hpa_from_user_spec() → cluster_resources.add()
+   │   ├─ StatefulSet replicas from scaler status
+   │   └─ drive state machine (reconcile_scaler)
+   │
+   ├─ ExternallyScaled
+   │   ├─ build_scaler() → cluster_resources.add()
+   │   ├─ initialize_scaler_status() if freshly created
+   │   ├─ No HPA (user manages external scaler)
+   │   ├─ StatefulSet replicas from scaler status
+   │   └─ drive state machine (reconcile_scaler)
+   │
+   └─ Auto(auto_config)
+       └─ Not yet implemented — returns error
 
-3. Build & apply StatefulSet with resolved replica count
+3. Apply StatefulSet with effective replica count
 
 4. Drive scaler state machine  (reconcile_scaler)
    ┌─────────────┬───────────────────────────────────────────────┐
@@ -98,8 +146,16 @@ from its status.
 
 5. Admission webhook (commons-operator)
    └─ rejects spec.replicas changes while stage ∈ {PreScaling, Scaling, PostScaling}
-   └─ injects stackable.tech/cluster-kind label
 ```
+
+### Resource Lifecycle
+
+- **Scaler and HPA are managed via `ClusterResources.add()`** — labels and owner references
+  are set by `build_scaler()` / `build_hpa_from_user_spec()` before passing to `add()`.
+- **Orphan cleanup** — switching from `Hpa` to `Fixed` automatically removes the scaler and
+  HPA on the next reconcile via `delete_orphaned_resources()`.
+- **Watch registration** — `.owns()` on StackableScaler and HPA routes events to the owning
+  cluster CR via owner references (no label-based mappers needed).
 
 ### Product-Specific Hooks
 
@@ -110,9 +166,9 @@ from its status.
 
 ---
 
-## 3. Code Examples
+## 4. Code Examples
 
-### 3a. StackableScaler CRD (operator-rs)
+### 4a. StackableScaler CRD (operator-rs)
 
 ```rust
 // operator-rs/crates/stackable-operator/src/crd/scaler/mod.rs
@@ -130,9 +186,6 @@ from its status.
 )]
 pub struct StackableScalerSpec {
     pub replicas: i32,
-    pub cluster_ref: UnknownClusterRef,
-    pub role: String,
-    pub role_group: String,
 }
 
 pub enum ScalerStage {
@@ -144,25 +197,31 @@ pub enum ScalerStage {
 }
 ```
 
-### 3b. Replica Resolution (operator-rs)
+Identity is conveyed through owner references and standard Stackable labels
+(`app.kubernetes.io/name`, `instance`, `managed-by`, `component`, `role-group`),
+all set by `build_scaler()`.
+
+### 4b. ReplicasConfig Enum (operator-rs)
 
 ```rust
-// operator-rs/crates/stackable-operator/src/crd/scaler/mod.rs
+// operator-rs/crates/stackable-operator/src/crd/scaler/replicas_config.rs
 
-/// replicas: 0 + scaler present → read from scaler status
-/// anything else                 → pass through unchanged
-pub fn resolve_replicas(
-    role_group_replicas: Option<i32>,
-    scaler: Option<&v1alpha1::StackableScaler>,
-) -> Option<i32> {
-    match (role_group_replicas, scaler) {
-        (Some(0), Some(s)) => s.status.as_ref().map(|st| st.replicas),
-        (replicas, _) => replicas,
-    }
+pub enum ReplicasConfig {
+    Fixed(u16),
+    Hpa(HpaConfig),
+    Auto(AutoConfig),
+    ExternallyScaled,
+}
+
+impl Default for ReplicasConfig {
+    fn default() -> Self { Self::Fixed(1) }
 }
 ```
 
-### 3c. ScalingHooks Trait (operator-rs)
+Custom `Deserialize` impl handles bare integers (`3` → `Fixed(3)`), strings
+(`"externallyScaled"` → `ExternallyScaled`), and tagged objects (`{"hpa": {...}}`).
+
+### 4c. ScalingHooks Trait (operator-rs)
 
 ```rust
 // operator-rs/crates/stackable-operator/src/crd/scaler/hooks.rs
@@ -188,42 +247,63 @@ pub trait ScalingHooks {
 }
 ```
 
-### 3d. Operator Integration (nifi-operator controller, same pattern for trino)
+### 4d. Operator Integration (nifi-operator controller, same pattern for trino)
 
 ```rust
 // nifi-operator/rust/operator-binary/src/controller.rs  (simplified)
 
-// 1. Discover scaler for role groups with replicas: 0
-let scaler: Option<StackableScaler> = if rg_replicas == Some(0) {
-    client
-        .list_with_label_selector::<StackableScaler>(namespace, &selector)
-        .await?
-        .into_iter()
-        .find(|s| s.spec.cluster_ref.name == nifi.name_any()
-                && s.spec.role == rolegroup.role
-                && s.spec.role_group == rolegroup.role_group)
-} else { None };
+let replicas_config = role_group
+    .and_then(|rg| rg.replicas.clone())
+    .unwrap_or_default();
 
-// 2. Resolve effective replica count
-let replicas = resolve_replicas(rg_replicas.map(i32::from), scaler.as_ref());
+let (replicas, scaler_to_reconcile) = match &replicas_config {
+    ReplicasConfig::Fixed(n) => {
+        (Some(i32::from(*n)), None)
+    }
+    ReplicasConfig::Hpa(hpa_config) => {
+        // Build and apply scaler
+        let scaler = build_scaler(&nifi.name_any(), APP_NAME, namespace,
+            &rolegroup.role, &rolegroup.role_group, 1, &owner_ref, OPERATOR_NAME)?;
+        let applied_scaler = cluster_resources.add(client, scaler).await?;
 
-// 3. Build StatefulSet with resolved replicas
-let rg_statefulset = build_statefulset(replicas, ...)?;
+        // Initialize status on freshly created scalers to prevent scale-to-zero
+        if applied_scaler.status.is_none() {
+            initialize_scaler_status(client, &applied_scaler, 1, &selector_string).await?;
+        }
+
+        // Build and apply HPA targeting the scaler
+        let target_ref = scale_target_ref(&scaler_name, "autoscaling.stackable.tech", "v1alpha1");
+        let hpa = build_hpa_from_user_spec(&hpa_config.spec, &target_ref, ...)?;
+        cluster_resources.add(client, hpa).await?;
+
+        let replicas = applied_scaler.status.as_ref().map(|st| st.replicas);
+        (replicas, Some(applied_scaler))
+    }
+    ReplicasConfig::ExternallyScaled => {
+        // Same as Hpa but no HPA created
+        let scaler = build_scaler(...)?;
+        let applied_scaler = cluster_resources.add(client, scaler).await?;
+        if applied_scaler.status.is_none() {
+            initialize_scaler_status(client, &applied_scaler, 1, &selector_string).await?;
+        }
+        let replicas = applied_scaler.status.as_ref().map(|st| st.replicas);
+        (replicas, Some(applied_scaler))
+    }
+    ReplicasConfig::Auto(_) => return Err(Error::AutoScalingNotYetImplemented { .. }),
+};
+
+// Build StatefulSet with effective replicas
+let rg_statefulset = build_node_rolegroup_statefulset(replicas, ...)?;
 let applied_sts = cluster_resources.add(client, rg_statefulset).await?;
 
-// 4. Drive scaler state machine (calls hooks at right stages)
-if let Some(ref s) = scaler {
-    let result = reconcile_scaler(
-        s,
-        &NifiScalingHooks { namespace, credentials, ... },
-        client,
-        statefulset_stable,
-        &selector_string,
-    ).await?;
+// Drive scaler state machine (calls hooks at right stages)
+if let Some(ref s) = scaler_to_reconcile {
+    reconcile_scaler(s, &NifiScalingHooks { ... }, client,
+        statefulset_stable, &selector_string, &rolegroup.role_group).await?;
 }
 ```
 
-### 3e. Trino Pre-Scale Hook (graceful shutdown)
+### 4e. Trino Pre-Scale Hook (graceful shutdown)
 
 ```rust
 // trino-operator/rust/operator-binary/src/operations/scaling.rs
@@ -251,7 +331,7 @@ impl ScalingHooks for TrinoScalingHooks {
 }
 ```
 
-### 3f. NiFi Pre-Scale Hook (node offload & decommission)
+### 4f. NiFi Pre-Scale Hook (node offload & decommission)
 
 ```rust
 // nifi-operator/rust/operator-binary/src/operations/scaling.rs  (simplified)
@@ -282,10 +362,13 @@ impl ScalingHooks for NifiScalingHooks {
 }
 ```
 
-### 3g. Admission Webhook (commons-operator)
+### 4g. Admission Webhook (commons-operator)
 
 ```rust
 // commons-operator/rust/operator-binary/src/webhooks/scaler_admission.rs  (simplified)
+//
+// Uses the MutatingWebhook framework (no ValidatingWebhook in stackable-webhook yet),
+// but never returns patches — functionally a validating webhook.
 
 async fn scaler_admission_handler(
     client: Arc<Client>,
@@ -293,15 +376,16 @@ async fn scaler_admission_handler(
 ) -> AdmissionResponse {
     // On UPDATE: reject spec.replicas changes during active scaling
     if request.operation == Operation::Update {
-        if new.spec.replicas != old.spec.replicas {
-            let live = api.get(scaler_name).await?;
-            if live.status.current_state.stage.is_scaling_in_progress() {
-                return deny("Cannot update spec.replicas while scaling is in progress");
+        if let Some(old) = &request.old_object {
+            if scaler.spec.replicas != old.spec.replicas {
+                let live = api.get(scaler_name).await?;
+                if let Some(stage) = stage.filter(|s| s.is_scaling_in_progress()) {
+                    return deny("Cannot update spec.replicas while scaling is in progress");
+                }
             }
         }
     }
-    // Mutate: inject cluster-kind label from spec.clusterRef.kind
-    patch.add("/metadata/labels/stackable.tech~1cluster-kind", cluster_kind);
-    response.with_patch(patch)
+    // Allow — no patches, no mutations
+    AdmissionResponse::from(&request)
 }
 ```
